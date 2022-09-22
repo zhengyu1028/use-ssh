@@ -1,0 +1,287 @@
+package main
+
+import (
+	"errors"
+	"fmt"
+	"github.com/mitchellh/go-homedir"
+	"golang.org/x/crypto/ssh"
+	"io"
+	"io/ioutil"
+	"log"
+	"os"
+	"strings"
+	"time"
+)
+
+type internal_infomation interface {
+	HostInfo(path string) (map[string][]string, error)
+	SH_client(ip string) (string, error)
+	SH_server(ip string) error
+}
+
+type UserInfo struct {
+	user         string
+	passwd       string
+	space        string
+	timeforiperf string
+	model        string
+}
+
+func (u UserInfo) HostInfo(path string) (map[string][]string, error) { //获取PXY ip 并分类
+	f, err := os.Open("/etc/hosts")
+	defer f.Close()
+	if err != nil {
+		return nil, err
+	}
+
+	var hoststr []byte = make([]byte, 1024)
+
+	for {
+		hostinfo := make([]byte, 10, 10)
+		_, err = f.Read(hostinfo)
+		hoststr = append(hoststr, hostinfo...)
+		if len(hostinfo) > 0 && err == io.EOF {
+			hoststr = append(hoststr, hostinfo...)
+			break
+		}
+
+	}
+	hostlist := strings.Split(string(hoststr), "\n")
+	hostDir := make(map[string][]string) //声明map
+	for _, ele := range hostlist {
+
+		s := strings.Split(ele, " ")
+
+		if strings.Contains(ele, "DN") {
+			hostDir["DN"] = append(hostDir["DN"], s[0])
+		} else if strings.Contains(ele, "PXY") {
+			hostDir["PXY"] = append(hostDir["PXY"], s[0])
+		} else if strings.Contains(ele, "FGW") {
+			hostDir["FGW"] = append(hostDir["FGW"], s[0])
+		} else if strings.Contains(ele, "MN") {
+			hostDir["MN"] = append(hostDir["MN"], s[0])
+		} else {
+			hostDir["other"] = append(hostDir["other"], s[0])
+		}
+		//return hostDir1, nil
+	}
+	return hostDir, nil
+	//return string(hoststr), nil
+}
+
+func publicKeyAuthFunc(kPath string) ssh.AuthMethod { //获取密钥
+	keyPath, err := homedir.Expand(kPath)
+	if err != nil {
+		log.Fatal("查找密钥的主目录失败", err)
+	}
+	key, err := ioutil.ReadFile(keyPath)
+	if err != nil {
+		log.Fatal("ssh 密钥文件读取失败", err)
+	}
+	// Create the Signer for this private key.
+	signer, err := ssh.ParsePrivateKey(key)
+	if err != nil {
+		log.Fatal("ssh 关键签名失败", err)
+	}
+	return ssh.PublicKeys(signer)
+}
+
+func (u UserInfo) SH_client(ip string) (string, error) { //客户端执行iperf3
+	config := &ssh.ClientConfig{
+		Timeout:         5 * time.Second,
+		User:            u.user,
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		//HostKeyCallback: hostKeyCallBackFunc(h.Host),
+	}
+
+	if strings.Contains(u.passwd, "/") { //判断是否密钥登录
+		config.Auth = []ssh.AuthMethod{publicKeyAuthFunc(u.passwd)}
+	} else {
+		config.Auth = []ssh.AuthMethod{ssh.Password(u.passwd)}
+	}
+
+	sshClient, err := ssh.Dial("tcp", ip+":22", config)
+	if err != nil {
+		return "connecting faild", err
+	}
+	session, err := sshClient.NewSession()
+	if err != nil {
+		return "ssh connect error", err
+	}
+	defer session.Close()
+
+	//执行远程命令
+	cmd := fmt.Sprintf("yum -y install iperf3 > /dev/null ; iperf3 -c 192.168.4.10 -i %s -t %s", u.space, u.timeforiperf)
+	combo, err := session.CombinedOutput(cmd)
+
+	if err != nil {
+
+		//log.Fatal("远程执行cmd 失败", err)
+		return "iperf3 not found or can't install", err
+	}
+
+	return string(combo), nil
+}
+
+func (u UserInfo) SH_server(ip string) error { // 服务端执行 iperf3
+
+	config := &ssh.ClientConfig{
+		Timeout:         5 * time.Second,
+		User:            u.user,
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		//HostKeyCallback: hostKeyCallBackFunc(h.Host),
+	}
+
+	if strings.Contains(u.passwd, "/") { //判断是否密钥登录
+		config.Auth = []ssh.AuthMethod{publicKeyAuthFunc(u.passwd)}
+	} else {
+		config.Auth = []ssh.AuthMethod{ssh.Password(u.passwd)}
+	}
+
+	sshClient, err := ssh.Dial("tcp", ip+":22", config)
+	if err != nil {
+		return err
+	}
+	session, err := sshClient.NewSession()
+	if err != nil {
+		return err
+	}
+	defer session.Close()
+
+	//执行远程命令
+
+	_, err = session.CombinedOutput("yum -y install iperf3 ; iperf3 -s -i 1 -p 5201 &")
+
+	if err != nil {
+
+		log.Printf("server:%s 远程执行cmd 失败", ip)
+		return err
+	}
+
+	return nil
+}
+
+func main() {
+	u := UserInfo{
+		user:         os.Args[1],
+		passwd:       os.Args[2],
+		space:        os.Args[3],
+		timeforiperf: os.Args[4],
+		model:        os.Args[5],
+	}
+	var te internal_infomation
+	te = u
+	ipmap, err := te.HostInfo("/etc/hosts")
+	//fmt.Println(ipmap)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if u.model == "1" { //组内1对1
+		for index, elem := range ipmap["PXY"] {
+			if index%2 != 0 && index+1 != len(ipmap["PXY"]) {
+				continue
+			} else if index+1 == len(ipmap["PXY"]) && len(ipmap["PXY"])%2 != 0 {
+				err := u.SH_server(ipmap["PXY"][0])
+				if err != nil {
+
+					log.Println(errors.New("server open faild"))
+					continue
+
+				}
+
+				infomation, err := u.SH_client(ipmap["PXY"][index+1])
+				if err != nil {
+					log.Println(err)
+					continue
+
+				}
+				log.Fatal(infomation)
+
+			}
+			err := u.SH_server(elem)
+			if err != nil {
+				log.Println(err)
+				continue
+
+			}
+			infomation, err := u.SH_client(ipmap["PXY"][index+1])
+			if err != nil {
+				log.Println(err)
+				continue
+			}
+			log.Fatal(infomation) //将数据写入execl表
+
+		}
+	}
+
+	if u.model == "2" { //组外1对1
+		i := 0
+		for ind, ele := range ipmap["PXY"] {
+
+			err := te.SH_server(ipmap["MN"][i])
+			if err != nil {
+				log.Println(err)
+				continue
+			}
+			info, err := te.SH_client(ele)
+			i++
+			if err != nil {
+				log.Println(err)
+				continue
+			}
+			log.Println(info)
+			if i > ind {
+				i = 0
+			}
+
+		}
+	}
+
+	if u.model == "3" { //组外1对4
+		a := 0
+		for i := 0; i < len(ipmap["PXY"]); i += 4 {
+
+			err := te.SH_server(ipmap["MN"][a])
+			if err != nil {
+				log.Println(err)
+				continue
+			}
+			a++
+			go func() {
+				info, err := te.SH_client(ipmap["PXY"][i])
+				if err != nil {
+					log.Println(err)
+
+				}
+				log.Println(info)
+			}()
+			go func() {
+				info, err := te.SH_client(ipmap["PXY"][i+1])
+				if err != nil {
+					log.Println(err)
+				}
+				log.Println(info)
+			}()
+			go func() {
+				info, err := te.SH_client(ipmap["PXY"][i+2])
+				if err != nil {
+					log.Println(err)
+				}
+				log.Println(info)
+			}()
+			go func() {
+				info, err := te.SH_client(ipmap["PXY"][i+3])
+				if err != nil {
+					log.Println(err)
+				}
+				log.Println(info)
+			}()
+
+			if a >= len(ipmap["MN"]) {
+				a = 0
+			}
+
+		}
+	}
+
+}
